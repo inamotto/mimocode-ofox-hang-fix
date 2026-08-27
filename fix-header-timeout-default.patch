@@ -1,0 +1,36 @@
+diff --git a/packages/opencode/src/provider/provider.ts b/packages/opencode/src/provider/provider.ts
+index 78f9684..bb7ce23 100644
+--- a/packages/opencode/src/provider/provider.ts
++++ b/packages/opencode/src/provider/provider.ts
+@@ -1677,7 +1677,7 @@ const layer: Layer.Layer<
+ 
+         const customFetch = options["fetch"]
+         const userChunkTimeout = options["chunkTimeout"]
+-        const headerTimeout = options["headerTimeout"]
++        const headerTimeout = options["headerTimeout"] ?? DEFAULT_OPENAI_HEADER_TIMEOUT
+         const chunkTimeout =
+           typeof userChunkTimeout === "number"
+             ? userChunkTimeout  // user-set value (incl. 0 / negative to disable)
+diff --git a/packages/opencode/test/provider/provider-chunk-timeout.test.ts b/packages/opencode/test/provider/provider-chunk-timeout.test.ts
+index 847fa46..f218c92 100644
+--- a/packages/opencode/test/provider/provider-chunk-timeout.test.ts
++++ b/packages/opencode/test/provider/provider-chunk-timeout.test.ts
+@@ -24,4 +24,18 @@ describe("provider timeouts", () => {
+     expect(pickChunkTimeout({ chunkTimeout: "not a number" })).toBe(DEFAULT_CHUNK_TIMEOUT)
+     expect(pickChunkTimeout({ chunkTimeout: null })).toBe(DEFAULT_CHUNK_TIMEOUT)
+   })
++
++  test("default headerTimeout falls back to DEFAULT_OPENAI_HEADER_TIMEOUT when not set", () => {
++    // Mirrors provider.ts:1680 header timeout selection logic.
++    function pickHeaderTimeout(options: { headerTimeout?: unknown }): number | undefined {
++      const headerTimeout = options["headerTimeout"] ?? DEFAULT_OPENAI_HEADER_TIMEOUT
++      const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
++      return typeof headerTimeoutMs === "number" ? headerTimeoutMs : undefined
++    }
++
++    expect(pickHeaderTimeout({})).toBe(DEFAULT_OPENAI_HEADER_TIMEOUT)
++    expect(pickHeaderTimeout({ headerTimeout: 60_000 })).toBe(60_000)
++    expect(pickHeaderTimeout({ headerTimeout: false })).toBeUndefined()
++    expect(pickHeaderTimeout({ headerTimeout: null })).toBe(DEFAULT_OPENAI_HEADER_TIMEOUT)
++  })
+ })
