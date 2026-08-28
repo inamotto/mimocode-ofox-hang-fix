@@ -2,27 +2,43 @@
 
 ## Summary
 
-When a user configures a custom OpenAI-compatible provider (e.g., **ofox** at `https://api.ofox.ai/v1`) and attempts to use a model, MiMoCode hangs indefinitely without producing any error. The root cause is a missing default `headerTimeout` for providers that are not the built-in `openai` provider.
+When a user configures a custom OpenAI-compatible provider (e.g., **ofox** at `https://api.ofox.ai/v1`) and attempts to use a model, MiMoCode hangs indefinitely without producing any error. After investigation, we identified **two independent root causes** and one **secondary issue**:
+
+1. **Primary root cause**: Clash Verge TUN mode intercepting DNS for `ofox.ai`, causing TLS handshake to hang indefinitely
+2. **Secondary root cause**: Missing default `headerTimeout` for custom providers in MiMoCode's `provider.ts`
+3. **Model ID issue**: ofox requires date-suffixed model IDs (e.g., `deepseek/deepseek-v4-flash-0731`), bare IDs return 404
 
 ## Environment
 
 - **MiMoCode version**: 0.1.13
 - **Provider**: Custom OpenAI-compatible (e.g., ofox `https://api.ofox.ai/v1`)
 - **Config file**: `~/.config/mimocode/mimocode.jsonc`
-- **OS**: Windows
-
-## How to Reproduce
-
-1. Run `mimo` (or open the TUI) and execute `/login`.
-2. Select "ofox" or "Custom provider" from the provider list.
-3. Enter the base URL (`https://api.ofox.ai/v1`), API key, and model ID.
-4. Select a model (e.g., `openai/gpt-5.6-sol`).
-5. Send a message to the model.
-6. **Observe**: The TUI hangs indefinitely at the "thinking" stage with no error, no timeout, and no response.
+- **OS**: Windows 11
+- **Network**: Clash Verge with TUN mode enabled
 
 ## Root Cause Analysis
 
-### The Timeout Mechanism in `provider.ts`
+### Root Cause 1: Clash Verge TUN Mode DNS Interception (Primary)
+
+**The primary cause of the infinite hang was NOT MiMoCode code — it was the network proxy configuration.**
+
+Clash Verge's TUN mode intercepted DNS requests for `ofox.ai` and returned fake IPs (198.18.0.x range). This caused:
+- TCP connection to succeed (fake IP was reachable)
+- TLS handshake to hang indefinitely (couldn't complete with the fake endpoint)
+- No timeout fired because the TCP connection was technically "established"
+
+**Verification**: Direct `curl` to `https://api.ofox.ai/v1/models` hung indefinitely before the fix, returned results in ~2 seconds after.
+
+**Fix**: Added a domain-suffix rule in Clash Verge for `ofox.ai` to route through a working proxy node:
+- Rule type: "匹配域名后缀" (domain suffix match)
+- Domain: `ofox.ai`
+- This covers both `ofox.ai` and `api.ofox.ai` with a single rule
+
+### Root Cause 2: Missing Default `headerTimeout` (Secondary)
+
+Even after fixing the network issue, MiMoCode's code has a secondary issue: custom OpenAI-compatible providers don't get a default `headerTimeout`, so if the server doesn't respond for any reason (network issues, slow upstream, etc.), the request hangs indefinitely.
+
+**The Timeout Mechanism in `provider.ts`**
 
 MiMoCode wraps every HTTP fetch call to provider APIs with a custom timeout layer in `resolveSDK()` (in `packages/opencode/src/provider/provider.ts`). This wrapper has three independent timeout mechanisms:
 
@@ -49,7 +65,7 @@ const headerTimeoutCtl = typeof headerTimeoutMs === "number"
   : undefined   // ← undefined! No header timeout created.
 ```
 
-### Why Custom Providers Don't Get a Header Timeout
+**Why Custom Providers Don't Get a Header Timeout**
 
 The `custom()` function in `provider.ts` returns loaders for **specific** provider IDs (e.g., `openai`, `xiaomi`, `xai`, `anthropic`, `azure`, `opencode`, etc.). Each loader can set `options` that get merged into the provider's configuration. Only the `openai` loader sets `headerTimeout`:
 
@@ -71,7 +87,7 @@ A custom provider like "ofox" (or any user-added OpenAI-compatible provider) is 
 - `headerTimeoutCtl` (the `AbortController` that would abort the fetch after 5 minutes) is **never created**
 - The only active timeout is `chunkTimeout` (8 min), but `wrapSSE()` only fires **after response headers are received** — so it never triggers when the server is completely unresponsive
 
-### The Complete Hang Path
+**The Complete Hang Path (when network is broken)**
 
 ```
 getLanguage(model)
@@ -82,12 +98,42 @@ getLanguage(model)
           → HANGS FOREVER if server never responds
 ```
 
-When the ofox endpoint doesn't respond (due to network issues, proxy misconfiguration, firewall, or simply slow upstream), the `await fetchFn(...)` promise never resolves. No timeout fires because:
+When the ofox endpoint doesn't respond (due to Clash Verge TUN mode intercepting DNS), the `await fetchFn(...)` promise never resolves. No timeout fires because:
 1. `headerTimeoutCtl` is `undefined` — no header timeout
 2. `requestTimeoutCtl` is `undefined` — no request timeout (only set when `options["timeout"]` is a number)
 3. `chunkAbortCtl` exists (8 min), but `wrapSSE()` is only called **after** `res` is received, so it never gets a chance to fire
 
+### Issue 3: Ofox Model IDs Require Date Suffix
+
+Ofox's API requires model IDs to include a date suffix. Bare IDs without a date suffix return 404:
+
+| Model ID (WRONG) | Model ID (CORRECT) | Status |
+|---|---|---|
+| `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-flash-0731` | ❌ 404 → ✅ Works |
+| `deepseek/deepseek-v4-pro` | `deepseek/deepseek-v4-pro-0813` | ❌ 404 → ✅ Works |
+| `deepseek/deepseek-v4-flash-vision-exp` | `deepseek/deepseek-v4-flash-vision-exp` | ✅ Works (no date suffix needed) |
+
+Full list of available DeepSeek models on ofox (confirmed via `GET /v1/models`):
+- `deepseek/deepseek-v4-flash-0731` — Latest Flash
+- `deepseek/deepseek-v4-flash-0423` — Older Flash
+- `deepseek/deepseek-v4-flash-vision-exp` — Vision model
+- `deepseek/deepseek-v4-pro-0813` — Latest Pro
+- `deepseek/deepseek-v4-pro-0423` — Older Pro
+- `deepseek/deepseek-v3.2` — V3.2
+
 ## The Fix
+
+### Fix 1: Network (Clash Verge) — User Configuration
+
+Add a domain-suffix rule in Clash Verge for `ofox.ai`:
+1. Open Clash Verge → Rules → Add Rule
+2. Rule type: "匹配域名后缀" (domain suffix match)
+3. Domain: `ofox.ai`
+4. Select a working proxy node
+
+This covers both `ofox.ai` and `api.ofox.ai` with a single rule.
+
+### Fix 2: Code — Default `headerTimeout` for All Providers
 
 **File**: `packages/opencode/src/provider/provider.ts`, line 1680
 
@@ -107,7 +153,7 @@ This applies the `DEFAULT_OPENAI_HEADER_TIMEOUT` (5 minutes) as a fallback for *
 - Preserves `false` (explicit disable) because `??` does not treat `false` as nullish
 - Preserves `null` as a default to 5 minutes
 
-### Behavior Matrix After Fix
+**Behavior Matrix After Fix**
 
 | Provider config `headerTimeout` | Before fix | After fix |
 |---|---|---|
@@ -115,6 +161,40 @@ This applies the `DEFAULT_OPENAI_HEADER_TIMEOUT` (5 minutes) as a fallback for *
 | `false` (explicitly disabled) | No timeout | No timeout (unchanged) |
 | `60000` (custom value) | 1 min timeout | 1 min timeout (unchanged) |
 | `300000` (openai provider) | 5 min timeout | 5 min timeout (unchanged) |
+
+### Fix 3: Config — Use Correct Model IDs
+
+Update `~/.config/mimocode/mimocode.jsonc` to use date-suffixed model IDs:
+
+```jsonc
+{
+  "provider": {
+    "ofox": {
+      "name": "OfoxAI",
+      "npm": "@ai-sdk/openai-compatible",
+      "only_configured_models": true,
+      "env": ["OFOX_API_KEY"],
+      "models": {
+        "deepseek/deepseek-v4-flash-0731": {
+          "name": "DeepSeek V4 Flash 0731"
+        },
+        "deepseek/deepseek-v4-pro-0813": {
+          "name": "DeepSeek V4 Pro 0813"
+        },
+        "deepseek/deepseek-v4-flash-vision-exp": {
+          "name": "DeepSeek V4 Flash Vision"
+        }
+      },
+      "options": {
+        "baseURL": "https://api.ofox.ai/v1",
+        "apiKey": "{env:OFOX_API_KEY}",
+        "headerTimeout": 300000,
+        "chunkTimeout": 480000
+      }
+    }
+  }
+}
+```
 
 ## Protocol: Responses API vs Chat Completions API
 
@@ -140,55 +220,20 @@ MiMoCode routes custom OpenAI-compatible providers through `sdk.languageModel()`
 
 **For ofox specifically**, since it supports both protocols, using the Responses API would provide better cache efficiency. However, changing this for all custom providers would require verifying that each custom endpoint supports the Responses API (not all do).
 
-## Network and Proxy Considerations
+## Additional Notes
 
-The user noted that network issues may contribute to the hang and suggested using system proxy.
+### Ofox is NOT Geo-Blocked in China
 
-### How Proxy Works in MiMoCode
+Contrary to initial assumptions, ofox.ai is NOT blocked in mainland China:
+- 88.52% of visitors are from China (HypeStat)
+- API infrastructure on Alibaba Cloud (Hong Kong, Japan)
+- Website on Cloudflare CDN
+- Domain registered 2025-12-12, registrant country SG
 
-- MiMoCode uses Bun's native `fetch` for all HTTP requests to provider APIs.
-- Bun's `fetch` respects standard proxy environment variables:
-  - `HTTPS_PROXY` / `https_proxy` — for HTTPS requests
-  - `HTTP_PROXY` / `http_proxy` — for HTTP requests
-  - `NO_PROXY` / `no_proxy` — to bypass proxy for specific hosts
-
-### Windows-Specific Note
-
-On Windows, the system proxy is often configured via **WinHTTP** (registry), not as environment variables. Bun's `fetch` may not automatically pick up WinHTTP proxy settings. If the ofox endpoint (`api.ofox.ai`) is only reachable through a corporate proxy, the user should:
-
-```powershell
-# Set proxy explicitly
-$env:HTTPS_PROXY = "http://proxy.example.com:8080"
-$env:HTTP_PROXY = "http://proxy.example.com:8080"
-```
-
-After setting these and restarting MiMoCode, the `headerTimeout` fix ensures that even if the proxy is misconfigured, the request will time out after 5 minutes instead of hanging forever.
-
-## Workaround (Before Fix is Released)
-
-Users experiencing this issue can add `headerTimeout` to their provider config as a temporary workaround:
-
-```jsonc
-{
-  "provider": {
-    "ofox": {
-      "name": "OfoxAI",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "https://api.ofox.ai/v1",
-        "apiKey": "{env:OFOX_API_KEY}",
-        "headerTimeout": 300000,
-        "chunkTimeout": 480000
-      },
-      "models": {
-        "openai/gpt-5.6-sol": { "name": "GPT-5.6" }
-      }
-    }
-  }
-}
-```
+Connection issues were caused by local proxy configuration (Clash Verge TUN mode), not geo-restriction.
 
 ## Files Changed
 
 1. `packages/opencode/src/provider/provider.ts` — Added default `headerTimeout` fallback
 2. `packages/opencode/test/provider/provider-chunk-timeout.test.ts` — Added test for default header timeout behavior
+3. `~/.config/mimocode/mimocode.jsonc` — Added ofox provider with correct model IDs and timeout config
